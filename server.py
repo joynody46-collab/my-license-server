@@ -80,6 +80,30 @@ def add_license():
     conn.close()
     
     return jsonify({"status": "success", "hwid": hwid, "date": str(new_date), "mode": mode})
+# === НОВАЯ ФУНКЦИЯ: ПОЛУЧИТЬ ВЕСЬ СПИСОК ===
+@app.route('/list', methods=['POST'])
+def get_all_licenses():
+    data = request.json
+    # Обязательно проверяем пароль, чтобы базу не украли
+    if data.get('secret') != API_SECRET:
+        return jsonify({"error": "Forbidden"}), 403
 
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Запрашиваем HWID и Дату, сортируем по дате окончания
+        cur.execute("SELECT hwid, expiry_date FROM licenses ORDER BY expiry_date ASC")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Превращаем в красивый список
+        licenses_list = [{"hwid": row[0], "date": str(row[1])} for row in rows]
+        
+        return jsonify({"status": "success", "licenses": licenses_list})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+        
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
+
