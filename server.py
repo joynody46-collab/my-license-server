@@ -5,21 +5,48 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Получаем настройки
 DATABASE_URL = os.environ.get("DATABASE_URL")
 API_SECRET = os.environ.get("API_SECRET")
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
+def init_db():
+    """Создает таблицу, если её нет"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS licenses (
+                hwid VARCHAR(255) PRIMARY KEY,
+                expiry_date DATE NOT NULL
+            );
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("База данных проверена/создана.")
+    except Exception as e:
+        print(f"Ошибка БД: {e}")
+
+# Инициализация при старте (если переменная задана)
+if DATABASE_URL:
+    init_db()
+
 @app.route('/')
 def home():
-    return "License Server Updated!"
+    return "License Server is Live!"
 
-# Проверка лицензии (без изменений)
+# === 1. ПРОВЕРКА ЛИЦЕНЗИИ ===
 @app.route('/check', methods=['POST'])
 def check():
-    data = request.json
+    data = request.json or {}
     hwid = data.get('hwid')
+    
+    if not hwid:
+        return jsonify({"status": "error", "message": "No HWID"}), 400
+
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -36,74 +63,75 @@ def check():
                 return jsonify({"status": "expired", "date": str(expiry)})
         return jsonify({"status": "not_found"})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
-# Выдача/Продление лицензии (ОБНОВЛЕНО)
+# === 2. ДОБАВЛЕНИЕ / ПРОДЛЕНИЕ / БАН ===
 @app.route('/add', methods=['POST'])
 def add_license():
-    data = request.json
+    data = request.json or {}
     if data.get('secret') != API_SECRET:
-        return jsonify({"error": "Wrong secret"}), 403
+        return jsonify({"error": "Forbidden"}), 403
 
     hwid = data.get('hwid')
     days = int(data.get('days', 30))
-    mode = data.get('mode', 'set') # 'set' (с сегодня) или 'add' (продлить)
+    mode = data.get('mode', 'set') # 'set' = установить, 'add' = продлить
     
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # 1. Сначала ищем, есть ли такая лицензия
-    cur.execute("SELECT expiry_date FROM licenses WHERE hwid = %s", (hwid,))
-    row = cur.fetchone()
-    
-    today = datetime.date.today()
-    current_expiry = row[0] if row else today
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Получаем текущую дату окончания (если есть)
+        cur.execute("SELECT expiry_date FROM licenses WHERE hwid = %s", (hwid,))
+        row = cur.fetchone()
+        
+        today = datetime.date.today()
+        current_expiry = row[0] if row else today
 
-    # 2. Логика расчета даты
-    if mode == 'add':
-        # Если лицензия уже просрочена, продлеваем от СЕГОДНЯ. 
-        # Если активна, продлеваем от ДАТЫ ОКОНЧАНИЯ.
-        start_date = max(current_expiry, today)
-        new_date = start_date + datetime.timedelta(days=days)
-    else:
-        # Режим 'set' (или 'ban') - считаем от сегодня
-        new_date = today + datetime.timedelta(days=days)
+        # Логика расчета
+        if mode == 'add':
+            # Если продлеваем: берем максимум от (сегодня или дата_окончания) + дни
+            start_date = max(current_expiry, today)
+            new_date = start_date + datetime.timedelta(days=days)
+        else:
+            # Если 'set' (новая или бан): считаем от сегодня
+            new_date = today + datetime.timedelta(days=days)
 
-    # 3. Сохраняем
-    cur.execute("""
-        INSERT INTO licenses (hwid, expiry_date) VALUES (%s, %s)
-        ON CONFLICT (hwid) DO UPDATE SET expiry_date = EXCLUDED.expiry_date
-    """, (hwid, new_date))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return jsonify({"status": "success", "hwid": hwid, "date": str(new_date), "mode": mode})
-# === НОВАЯ ФУНКЦИЯ: ПОЛУЧИТЬ ВЕСЬ СПИСОК ===
+        # Сохраняем (Upsert)
+        cur.execute("""
+            INSERT INTO licenses (hwid, expiry_date) VALUES (%s, %s)
+            ON CONFLICT (hwid) DO UPDATE SET expiry_date = EXCLUDED.expiry_date
+        """, (hwid, new_date))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({"status": "success", "hwid": hwid, "date": str(new_date)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# === 3. ПОЛУЧИТЬ ВЕСЬ СПИСОК ===
 @app.route('/list', methods=['POST'])
 def get_all_licenses():
-    data = request.json
-    # Обязательно проверяем пароль, чтобы базу не украли
+    data = request.json or {}
     if data.get('secret') != API_SECRET:
         return jsonify({"error": "Forbidden"}), 403
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Запрашиваем HWID и Дату, сортируем по дате окончания
-        cur.execute("SELECT hwid, expiry_date FROM licenses ORDER BY expiry_date ASC")
+        cur.execute("SELECT hwid, expiry_date FROM licenses ORDER BY expiry_date DESC")
         rows = cur.fetchall()
         cur.close()
         conn.close()
 
-        # Превращаем в красивый список
-        licenses_list = [{"hwid": row[0], "date": str(row[1])} for row in rows]
+        # Формируем список
+        licenses_list = [{"hwid": r[0], "date": str(r[1])} for r in rows]
         
         return jsonify({"status": "success", "licenses": licenses_list})
     except Exception as e:
-        return jsonify({"error": str(e)})
-        
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+        return jsonify({"error": str(e)}), 500
 
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
